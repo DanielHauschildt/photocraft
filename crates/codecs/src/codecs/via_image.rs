@@ -35,12 +35,45 @@ fn map_err(f: Format, e: image::ImageError) -> CodecError {
 pub(crate) fn decode(f: Format, bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     let fmt = image_format(f).ok_or_else(|| CodecError::unsupported(f, "not handled by image backend"))?;
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), fmt);
+    reader.limits(image_limits(limits));
+    let dec = reader.into_decoder().map_err(|e| map_err(f, e))?;
+    finish(f, dec, bytes, limits)
+}
+
+// One function per format, each naming its concrete decoder, so a caller links only that decoder
+// (`decode` above goes through `ImageReader`, which links every enabled one).
+macro_rules! decode_fns {
+    ($($name:ident => $format:expr, $decoder:ty;)*) => {$(
+        pub(crate) fn $name(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+            let f = $format;
+            let mut dec = <$decoder>::new(Cursor::new(bytes)).map_err(|e| map_err(f, e))?;
+            // The order `ImageReader::into_decoder` uses: construct, then apply the limits.
+            dec.set_limits(image_limits(limits)).map_err(|e| map_err(f, e))?;
+            finish(f, dec, bytes, limits)
+        }
+    )*};
+}
+
+decode_fns! {
+    decode_gif => Format::Gif, image::codecs::gif::GifDecoder<Cursor<&[u8]>>;
+    decode_bmp => Format::Bmp, image::codecs::bmp::BmpDecoder<Cursor<&[u8]>>;
+    decode_tga => Format::Tga, image::codecs::tga::TgaDecoder<Cursor<&[u8]>>;
+    decode_ico => Format::Ico, image::codecs::ico::IcoDecoder<Cursor<&[u8]>>;
+    decode_qoi => Format::Qoi, image::codecs::qoi::QoiDecoder<Cursor<&[u8]>>;
+    decode_hdr => Format::Hdr, image::codecs::hdr::HdrDecoder<Cursor<&[u8]>>;
+}
+
+fn image_limits(limits: &Limits) -> image::Limits {
     let mut il = image::Limits::default();
     il.max_image_width = Some(limits.max_width);
     il.max_image_height = Some(limits.max_height);
     il.max_alloc = Some(limits.max_alloc);
-    reader.limits(il);
-    let mut dec = reader.into_decoder().map_err(|e| map_err(f, e))?;
+    il
+}
+
+/// The steps after the decoder exists, shared by every format.
+fn finish(f: Format, dec: impl ImageDecoder, bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+    let mut dec = dec;
     let (w, h) = dec.dimensions();
     limits.check_bytes(w, h, dec.color_type().bytes_per_pixel() as u64)?;
     let icc = dec.icc_profile().ok().flatten();
